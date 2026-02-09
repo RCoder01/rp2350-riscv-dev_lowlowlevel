@@ -5,6 +5,9 @@ SECTIONS
   . = 0x0;
 
   .text : {
+    KEEP(*(.text._start))
+    *(.text._start)
+    *(.text._start.*)
     *(.text*)
     *(.rodata*)
   }
