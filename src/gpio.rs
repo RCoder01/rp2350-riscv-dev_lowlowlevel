@@ -1,3 +1,5 @@
+use core::ptr;
+
 #[repr(u8)]
 #[allow(unused)]
 #[derive(Clone, Copy)]
@@ -108,64 +110,46 @@ impl GpioPin {
     }
 }
 
-pub const IO_BANK0_BASE: *mut u32 = 0x4002_8000 as _;
-pub const PADS_BANK0_BASE: *mut u32 = 0x4003_8000 as _;
+pub const IO_BANK0_BASE: *mut u32 = ptr::without_provenance_mut(0x4002_8000);
+pub const PADS_BANK0_BASE: *mut u32 = ptr::without_provenance_mut(0x4003_8000);
 
 pub const fn gpio_status_reg(pin: GpioPin) -> *mut u32 {
-    unsafe { IO_BANK0_BASE.offset((pin as u8 * 2) as _) }
+    IO_BANK0_BASE.wrapping_offset((pin as u8 * 2) as _)
 }
 
 pub const fn gpio_ctrl_reg(pin: GpioPin) -> *mut u32 {
-    unsafe { IO_BANK0_BASE.offset((pin as u8 * 2 + 1) as _) }
+    IO_BANK0_BASE.wrapping_offset((pin as u8 * 2 + 1) as _)
 }
 
 pub const fn pads_gpio_reg(pin: GpioPin) -> *mut u32 {
-    unsafe { PADS_BANK0_BASE.offset((pin as u8 + 1) as _) }
+    PADS_BANK0_BASE.wrapping_offset((pin as u8 + 1) as _)
 }
 
-pub const SIO_GPIO_OE_SET: *mut u32 = 0xd000_0038_usize as _;
-pub const SIO_GPIO_OUT_SET: *mut u32 = 0xd000_0018_usize as _;
-pub const SIO_GPIO_OUT_CLR: *mut u32 = 0xd000_0020_usize as _;
-pub const SIO_GPIO_OUT_XOR: *mut u32 = 0xD000_0028_usize as _;
+pub const SIO_GPIO_OE_SET: *mut u32 = ptr::without_provenance_mut(0xD000_0038_usize);
+pub const SIO_GPIO_OUT_SET: *mut u32 = ptr::without_provenance_mut(0xD000_0018_usize);
+pub const SIO_GPIO_OUT_CLR: *mut u32 = ptr::without_provenance_mut(0xD000_0020_usize);
+pub const SIO_GPIO_OUT_XOR: *mut u32 = ptr::without_provenance_mut(0xD000_0028_usize);
+
+/// base_addr must be a pointer to two registers
+unsafe fn write_pin(base_addr: *mut u32, pin: GpioPin) {
+    let addr = base_addr.wrapping_offset(pin as isize / 32);
+    unsafe { addr.write_volatile(1 << (pin as u32 % 32)) }
+}
 
 pub fn gpio_output_enable(pin: GpioPin) {
-    let mut addr = SIO_GPIO_OE_SET;
-    if (pin as u8) >= 32 {
-        addr = unsafe { addr.offset(1) };
-    }
-    unsafe {
-        addr.write_volatile(1 << (pin as u32));
-    }
+    unsafe { write_pin(SIO_GPIO_OE_SET, pin) }
 }
 
 pub fn gpio_output_set(pin: GpioPin) {
-    let mut addr = SIO_GPIO_OUT_SET;
-    if (pin as u8) >= 32 {
-        addr = unsafe { addr.offset(1) };
-    }
-    unsafe {
-        addr.write_volatile(1 << (pin as u32));
-    }
+    unsafe { write_pin(SIO_GPIO_OUT_SET, pin) }
 }
 
 pub fn gpio_output_clear(pin: GpioPin) {
-    let mut addr = SIO_GPIO_OUT_CLR;
-    if (pin as u8) >= 32 {
-        addr = unsafe { addr.offset(1) };
-    }
-    unsafe {
-        addr.write_volatile(1 << (pin as u32));
-    }
+    unsafe { write_pin(SIO_GPIO_OUT_CLR, pin) }
 }
 
 pub fn gpio_output_xor(pin: GpioPin) {
-    let mut addr = SIO_GPIO_OUT_XOR;
-    if (pin as u8) >= 32 {
-        addr = unsafe { addr.offset(1) };
-    }
-    unsafe {
-        addr.write_volatile(1 << (pin as u32));
-    }
+    unsafe { write_pin(SIO_GPIO_OUT_XOR, pin) }
 }
 
 pub const LED_PIN: GpioPin = GpioPin::GPIO25;
