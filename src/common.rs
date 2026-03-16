@@ -1,11 +1,17 @@
-use core::arch::asm;
+use core::{arch::asm, mem::MaybeUninit};
 
+#[derive(Copy, Clone)]
 pub struct AliasedRegister(*mut u32);
 
 impl AliasedRegister {
     /// Base addr must be a hardware register with set/clr/xor aliases
     pub const unsafe fn new(base_addr: *mut u32) -> Self {
         Self(base_addr)
+    }
+
+    /// Base addr must be a hardware register with set/clr/xor aliases
+    pub const unsafe fn from_addr(base_addr: usize) -> Self {
+        Self(core::ptr::without_provenance_mut(base_addr))
     }
 
     pub fn write(self, value: u32) {
@@ -19,15 +25,46 @@ impl AliasedRegister {
     }
 
     pub fn xor(self, bits: u32) {
-        unsafe { self.0.wrapping_offset(1 << 12).write_volatile(bits) }
+        unsafe { self.0.wrapping_byte_offset(0x1000).write_volatile(bits) }
     }
 
     pub fn set(self, bits: u32) {
-        unsafe { self.0.wrapping_offset(2 << 12).write_volatile(bits) }
+        unsafe { self.0.wrapping_byte_offset(0x2000).write_volatile(bits) }
     }
 
     pub fn clear(self, bits: u32) {
-        unsafe { self.0.wrapping_offset(3 << 12).write_volatile(bits) }
+        unsafe { self.0.wrapping_byte_offset(0x3000).write_volatile(bits) }
+    }
+
+    /// addr+4*words must be a hardware register with set/clr/xor aliases
+    pub const unsafe fn offset(self, words: usize) -> Self {
+        Self(self.0.wrapping_add(words))
+    }
+
+    /// addr+bytes must be a hardware register with set/clr/xor aliases
+    pub const unsafe fn offset_bytes(self, bytes: usize) -> Self {
+        Self(self.0.wrapping_byte_add(bytes))
+    }
+}
+
+pub struct Defer<F: FnOnce()> {
+    f: MaybeUninit<F>,
+}
+
+impl<F: FnOnce()> Defer<F> {
+    pub fn new(f: F) -> Self {
+        Self {
+            f: MaybeUninit::new(f),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        let mut new_f = MaybeUninit::uninit();
+        core::mem::swap(&mut self.f, &mut new_f);
+        let f = unsafe { new_f.assume_init() };
+        f();
     }
 }
 
@@ -74,6 +111,12 @@ pub unsafe fn csr_set<const CSR: u32>(value: usize) {
     }
 }
 
+pub unsafe fn csr_set_imm<const CSR: u32, const VALUE: usize>() {
+    unsafe {
+        asm!("csrsi    {CSR}, {value}", value = const VALUE, CSR = const CSR);
+    }
+}
+
 pub unsafe fn csr_read_set<const CSR: u32>(value: usize) -> usize {
     let read: usize;
     unsafe {
@@ -93,6 +136,12 @@ pub unsafe fn csr_read_set_imm<const CSR: u32, const VALUE: usize>() -> usize {
 pub unsafe fn csr_clear<const CSR: u32>(value: usize) {
     unsafe {
         asm!("csrc     {CSR}, {value}", value = in(reg) value, CSR = const CSR);
+    }
+}
+
+pub unsafe fn csr_clear_imm<const CSR: u32, const VALUE: usize>() {
+    unsafe {
+        asm!("csrci    {CSR}, {value}", value = const VALUE, CSR = const CSR);
     }
 }
 

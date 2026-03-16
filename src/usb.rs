@@ -1,45 +1,797 @@
-use core::ptr;
+use core::{iter::zip, marker::PhantomData, num::NonZeroU8, ptr};
 
-use crate::common::{AliasedRegister, csr_clear, csr_set, nop_volatile};
-
-pub const RESETS_BASE: *mut u32 = ptr::without_provenance_mut(0x4002_0000);
-pub const RESETS_RESET: AliasedRegister =
-    unsafe { AliasedRegister::new(RESETS_BASE.wrapping_offset(0)) };
-pub const RESETS_WDSEL: AliasedRegister =
-    unsafe { AliasedRegister::new(RESETS_BASE.wrapping_offset(1)) };
-pub const RESETS_RESET_DONE: AliasedRegister =
-    unsafe { AliasedRegister::new(RESETS_BASE.wrapping_offset(2)) };
+use crate::{
+    blink_partial_value,
+    clocks::{PLL_SYS_PARAMS, PLL_USB_PARAMS},
+    common::{AliasedRegister, csr_clear, csr_set, nop_volatile},
+    delay,
+    resets::{RESETS_RESET, RESETS_RESET_DONE},
+};
 
 const RESETS_RESET_USBCTRL: u32 = 28;
 const USBCTRL_MASK: u32 = 1 << RESETS_RESET_USBCTRL;
 
-const USBCTRL_DPRAM_BASE: *mut u8 = ptr::without_provenance_mut(0x50100000);
+const USBCTRL_DPRAM_BASE: *mut u8 = ptr::without_provenance_mut(0x5010_0000);
 const USBCTRL_DPRAM_LEN: usize = 4 * 1024;
 const USBCTRL_DPRAM: *mut [u8; USBCTRL_DPRAM_LEN] = USBCTRL_DPRAM_BASE.cast();
+
+#[derive(Copy, Clone)]
+pub struct DPRAMPtr<T> {
+    byte_offset: u16,
+    _type: PhantomData<*mut T>,
+}
+
+impl<T> DPRAMPtr<T> {
+    pub const fn new(byte_offset: u16) -> Self {
+        assert!((byte_offset as usize) < USBCTRL_DPRAM_LEN);
+        assert!((byte_offset as usize) + size_of::<T>() <= USBCTRL_DPRAM_LEN);
+        Self {
+            byte_offset,
+            _type: PhantomData,
+        }
+    }
+
+    pub const fn cast<U>(self) -> DPRAMPtr<U> {
+        DPRAMPtr::new(self.byte_offset)
+    }
+
+    pub fn byte_offset(self) -> u16 {
+        self.byte_offset
+    }
+
+    pub fn write(self, val: T)
+    where
+        T: Copy, // Don't want to have to deal with T drop issues
+    {
+        let ptr = USBCTRL_DPRAM_BASE.wrapping_byte_offset(self.byte_offset as isize);
+        // are unaligned writes fine?
+        unsafe { ptr.cast::<T>().write_volatile(val) };
+    }
+
+    pub fn read(self) -> T
+    where
+        T: Copy, // Don't want to have to deal with T drop issues
+    {
+        let ptr = USBCTRL_DPRAM_BASE.wrapping_byte_offset(self.byte_offset as isize);
+        // are unaligned reads fine?
+        unsafe { ptr.cast::<T>().read_volatile() }
+    }
+
+    pub const fn offset_bytes(self, offset: i16) -> Self {
+        Self::new(self.byte_offset.wrapping_add_signed(offset))
+    }
+
+    pub const fn offset(self, offset: i16) -> Self {
+        let Some(byte_offset) = (size_of::<T>() as isize).checked_mul(offset as isize) else {
+            panic!("overflow in offset computation")
+        };
+        if !((i16::MIN as isize) <= byte_offset && byte_offset <= (i16::MAX as isize)) {
+            panic!("offset is too large");
+        }
+        self.offset_bytes(byte_offset as i16)
+    }
+}
+
+const USBCTRL_REG_BASE: AliasedRegister = unsafe { AliasedRegister::from_addr(0x5011_0000) };
+const USBCTRL_ADDR_ENDP: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x000) };
+const USBCTRL_MAIN_CTRL: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x040) };
+const USBCTRL_SIE_CTRL: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x04C) };
+const USBCTRL_SIE_STATUS: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x050) };
+const USBCTRL_BUF_STATUS: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x058) };
+const USBCTRL_USB_MUXING: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x074) };
+const USBCTRL_USB_PWR: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x078) };
+const USBCTRL_INTE: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x090) };
+const USBCTRL_INTS: AliasedRegister = unsafe { USBCTRL_REG_BASE.offset_bytes(0x098) };
 
 fn reset_usb() {
     RESETS_RESET.set(USBCTRL_MASK);
     RESETS_RESET.clear(USBCTRL_MASK);
-    while (!RESETS_RESET_DONE.read()) & USBCTRL_MASK != 0 {
+    while RESETS_RESET_DONE.read() & USBCTRL_MASK == 0 {
         nop_volatile();
     }
 }
 
+const USB_DPSRAM_WAIT_CYCLES: u32 = PLL_SYS_PARAMS
+    .f_out_post_div_hz()
+    .div_ceil(PLL_USB_PARAMS.f_out_post_div_hz());
+
+fn wait_sync_usb_dpsram() {
+    for _ in 0..USB_DPSRAM_WAIT_CYCLES {
+        nop_volatile()
+    }
+}
+
 const RVCSR_MEIFA: u32 = 0xBE2;
-const RVCSR_MEIEA: u32 = 0xBE2;
-const USBCTRL_IRQ: u32 = 25;
+const RVCSR_MEIEA: u32 = 0xBE0;
+const USBCTRL_IRQ: u32 = 14;
+
+const USBINT_BUF_STATUS: u32 = 1 << 4;
+const USBINT_BUS_RESET: u32 = 1 << 12;
+const USBINT_SETUP_REQ: u32 = 1 << 16;
 
 fn enable_usbctrl_interrupt() {
     // lower 4 bits specify which 16-bit window, upper 16 bits mask the window
-    let usbctrl = (1 << (USBCTRL_IRQ % 16)) << 16 + (USBCTRL_IRQ / 16);
+    let usbctrl = (((1 << (USBCTRL_IRQ % 16)) << 16) + (USBCTRL_IRQ / 16)) as usize;
     unsafe { csr_clear::<RVCSR_MEIFA>(usbctrl) }; // remove any pending forced interrupts
     unsafe { csr_set::<RVCSR_MEIEA>(usbctrl) }; // enable usbctrl interrupt
 }
 
-pub fn init_usb_blocking() {
+pub fn init_usb_as_device() {
     reset_usb();
     unsafe {
         USBCTRL_DPRAM.write_volatile([0; _]);
     }
     enable_usbctrl_interrupt();
+
+    const MUXING_TO_PHY: u32 = 1 << 0;
+    const MUXING_SOFTCON: u32 = 1 << 3;
+    // Mux the controller to the onboard usb phy
+    USBCTRL_USB_MUXING.write(MUXING_TO_PHY | MUXING_SOFTCON | 0);
+
+    const PWR_VBUS_DETECT: u32 = 1 << 2;
+    const PWR_VBUS_DETECT_OVERRIDE_ENABLE: u32 = 1 << 3;
+    // Force VBUS detect so the device thinks it is plugged into a host
+    USBCTRL_USB_PWR.write(PWR_VBUS_DETECT | PWR_VBUS_DETECT_OVERRIDE_ENABLE | 0);
+
+    const MAIN_CTRL_CONTROLLER_ENABLE: u32 = 1 << 0;
+    const MAIN_CTRL_HOST_OR_DEVICE: u32 = 1 << 1;
+    const MAIN_CTRL_PHY_ISOLATE: u32 = 1 << 2;
+    // Enable the USB controller in device mode.
+    USBCTRL_MAIN_CTRL.write(
+        (MAIN_CTRL_PHY_ISOLATE * 0)
+            | (MAIN_CTRL_HOST_OR_DEVICE * 0)
+            | MAIN_CTRL_CONTROLLER_ENABLE
+            | 0,
+    );
+
+    const SIE_EP0_INT_BUF: u32 = 1 << 29;
+    const SIE_PULLDOWN_ENABLE: u32 = 1 << 15;
+    // Enable an interrupt per EP0 transaction, disable pulldown
+    USBCTRL_SIE_CTRL.write(SIE_EP0_INT_BUF | (SIE_PULLDOWN_ENABLE * 0) | 0);
+
+    // Enable interrupts for when a buffer is done, when the bus is reset,
+    // and when a setup packet is received
+    USBCTRL_INTE.write(USBINT_BUF_STATUS | USBINT_BUS_RESET | USBINT_SETUP_REQ | 0);
+
+    DEVICE_CONFIG.configure_endpoints();
+
+    const SIE_PULLUP_ENABLE: u32 = 1 << 16;
+    // Present full speed device by enabling pull up on DP
+    USBCTRL_SIE_CTRL.set(SIE_PULLUP_ENABLE);
+}
+
+const EP0_OUT_BUFFER_CTRL_REG: DPRAMPtr<u32> =
+    endpoint_buffer_ctrl_register(EndpointId::Endpoint0, Direction::Out);
+const EP0_IN_BUFFER_CTRL_REG: DPRAMPtr<u32> =
+    endpoint_buffer_ctrl_register(EndpointId::Endpoint0, Direction::In);
+
+const EP0_BUFFER: DPRAMPtr<[u8; 0x40]> = DPRAMPtr::new(0x100);
+const BUFFER_0_AVAILABLE: u32 = 1 << 10;
+const BUFFER_0_DATA_PID: u32 = 1 << 13;
+const BUFFER_0_FULL: u32 = 1 << 15;
+
+fn acknowledge_out_request() {
+    let pid = (!EP0_IN_BUFFER_CTRL_REG.read()) & BUFFER_0_DATA_PID;
+    EP0_IN_BUFFER_CTRL_REG.write(pid | BUFFER_0_AVAILABLE | BUFFER_0_FULL);
+}
+
+fn send_device_descriptor(packet: &SetupPacket) {
+    let descriptor = DEVICE_CONFIG.device_descriptor;
+    let mut buf = [0; _];
+    descriptor.write(&mut buf);
+    EP0_BUFFER.cast().write(buf);
+    wait_sync_usb_dpsram();
+    EP0_IN_BUFFER_CTRL_REG.write(
+        (DeviceDescriptor::LENGTH as u32).min(packet.length as u32)
+            | BUFFER_0_AVAILABLE
+            | BUFFER_0_DATA_PID
+            | BUFFER_0_FULL,
+    );
+}
+
+fn send_config_descriptor(packet: &SetupPacket) {
+    const WRITE_SIZE: usize = {
+        let mut i = 0;
+        let mut len = ConfigurationDescriptor::LENGTH_USIZE + InterfaceDescriptor::LENGTH_USIZE;
+        while i < DEVICE_CONFIG.endpoints.len() {
+            if (DEVICE_CONFIG.endpoints[i].endpoint_address & 0x7F) != 0 {
+                len += EndpointDescriptor::LENGTH_USIZE;
+            }
+            i += 1;
+        }
+        len
+    };
+
+    fn split<'a, const N: usize>(slice: &mut &'a mut [u8]) -> &'a mut [u8; N] {
+        let first = slice.split_off_mut(..N).expect("buf should be long enough");
+        first.try_into().expect("slice has length N")
+    }
+
+    let mut buf = [0; WRITE_SIZE];
+    let mut slice = buf.as_mut_slice();
+    DEVICE_CONFIG
+        .configuration_descriptor
+        .write(split(&mut slice));
+    DEVICE_CONFIG.interface_descriptor.write(split(&mut slice));
+    for endpoint in DEVICE_CONFIG.endpoints {
+        if !matches!(endpoint.endpoint(), EndpointId::Endpoint0) {
+            endpoint.write(split(&mut slice));
+        }
+    }
+
+    const BUFFER_MIN: usize = if WRITE_SIZE < 64 { WRITE_SIZE } else { 64 };
+    const PTR: DPRAMPtr<[u8; BUFFER_MIN]> =
+        endpoint_buffer(EndpointId::Endpoint0, Direction::In).cast();
+    PTR.write(buf.as_slice().try_into().unwrap());
+    let len = BUFFER_MIN.min(packet.length as usize);
+    wait_sync_usb_dpsram();
+
+    const CTRL: DPRAMPtr<u32> = endpoint_buffer_ctrl_register(EndpointId::Endpoint0, Direction::In);
+    let pid = (!CTRL.read()) & BUFFER_0_DATA_PID;
+    let ctrl_val = len as u32 | BUFFER_0_AVAILABLE | BUFFER_0_FULL | pid;
+    CTRL.write(ctrl_val);
+}
+
+fn send_string_descriptor(packet: &SetupPacket) {
+    let i = (packet.value & 0xFF) as u8;
+    const PTR: DPRAMPtr<[u8; 64]> = endpoint_buffer(EndpointId::Endpoint0, Direction::In).cast();
+    let len = if i == 0 {
+        let buf = DEVICE_CONFIG.lang_descriptor;
+        PTR.cast().write(buf);
+        buf.len() as u8
+    } else {
+        let str = DEVICE_CONFIG.descriptor_strings[i as usize - 1];
+        let str_len = str.encode_utf16().count() * size_of::<u16>();
+        let len = (str_len + 2).min(64) as u8;
+        let mut buf = [0u16; 32];
+        buf[0] = u16::from_le_bytes([len, DescriptorType::String as u8]);
+        for (char, slot) in zip(str.encode_utf16(), &mut buf[1..]) {
+            *slot = char;
+        }
+        let buf_u8 = buf.map(|v| v.to_le_bytes());
+        PTR.write(buf_u8.as_flattened().try_into().unwrap());
+        len
+    };
+    wait_sync_usb_dpsram();
+
+    const CTRL: DPRAMPtr<u32> = endpoint_buffer_ctrl_register(EndpointId::Endpoint0, Direction::In);
+    let pid = (!CTRL.read()) & BUFFER_0_DATA_PID;
+    let ctrl_val = len as u32 | BUFFER_0_AVAILABLE | BUFFER_0_FULL | pid;
+    CTRL.write(ctrl_val);
+}
+
+const SIE_STATUS_SETUP_REC: u32 = 1 << 17;
+const SIE_STATUS_BUS_RESET: u32 = 1 << 19;
+pub fn usb_trap_handler() {
+    const NEW_ADDR: *mut u8 = 0x20000000 as *mut u8;
+    let mut status = USBCTRL_INTS.read();
+
+    if (status & USBINT_SETUP_REQ) != 0 {
+        // blink_partial_value(0, 2);
+        // delay(10);
+        // panic!();
+        status ^= USBINT_SETUP_REQ;
+        USBCTRL_SIE_STATUS.clear(SIE_STATUS_SETUP_REC);
+        // set curr pid to 0 so next pid will be 1
+        EP0_IN_BUFFER_CTRL_REG.write(EP0_IN_BUFFER_CTRL_REG.read() & !BUFFER_0_DATA_PID);
+        let packet = DPRAM_SETUP_PACKET.read();
+        match packet.request_direction() {
+            Direction::Out => match packet.request() {
+                Ok(Request::SetAddress) => {
+                    let new_addr = (packet.value & 0x7F) as u8 + 0x80;
+                    unsafe { NEW_ADDR.write(new_addr) };
+                    acknowledge_out_request();
+                }
+                Ok(Request::SetConfiguration) => {
+                    assert!(packet.value == 1); // device only has one configuration
+                    acknowledge_out_request();
+
+                    const CTRL_REG: DPRAMPtr<u32> =
+                        endpoint_buffer_ctrl_register(EndpointId::Endpoint1, Direction::Out);
+
+                    let len = 64;
+                    let pid = (!CTRL_REG.read()) & BUFFER_0_DATA_PID;
+                    CTRL_REG.write(pid | BUFFER_0_AVAILABLE | len);
+                }
+                _ => {
+                    acknowledge_out_request();
+                }
+            },
+            Direction::In => match packet.request() {
+                Ok(Request::GetDescriptor) => match ((packet.value >> 8) as u8).try_into() {
+                    Ok(DescriptorType::Device) => {
+                        send_device_descriptor(&packet);
+                    }
+                    Ok(DescriptorType::Config) => send_config_descriptor(&packet),
+                    Ok(DescriptorType::String) => send_string_descriptor(&packet),
+                    _ => todo!(),
+                },
+                _ => todo!(),
+            },
+        }
+    }
+
+    if (status & USBINT_BUF_STATUS) != 0 {
+        // blink_partial_value(1, 2);
+        // delay(10);
+        // panic!();
+        status ^= USBINT_BUF_STATUS;
+        let buffers = USBCTRL_BUF_STATUS.read();
+        let mut remaining = buffers;
+
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros();
+            // blink_partial_value(bit as _, 2);
+            // delay(10);
+            USBCTRL_BUF_STATUS.clear(1 << bit);
+            remaining &= !(1 << bit);
+
+            let endpoint = EndpointId::new(bit as u8 / 2).expect("bit/2 < 16");
+            let dir = if (bit & 0b1) == 0 {
+                Direction::In
+            } else {
+                Direction::Out
+            };
+            match (endpoint, dir) {
+                (EndpointId::Endpoint0, Direction::Out) => {}
+                (EndpointId::Endpoint0, Direction::In) => {
+                    let new_addr = unsafe { NEW_ADDR.read() };
+                    if new_addr & 0x80 != 0 {
+                        unsafe { NEW_ADDR.write(new_addr & 0x7F) };
+                        USBCTRL_ADDR_ENDP.write(new_addr as u32);
+                    } else {
+                        let pid = (!EP0_OUT_BUFFER_CTRL_REG.read()) & BUFFER_0_DATA_PID;
+                        EP0_OUT_BUFFER_CTRL_REG.write(pid | BUFFER_0_AVAILABLE);
+                    }
+                }
+                (EndpointId::Endpoint1, Direction::Out) => {
+                    // send on ep2_in
+                    todo!()
+                }
+                (EndpointId::Endpoint2, Direction::In) => {
+                    // send on ep1_out
+                    todo!()
+                }
+                _ => unimplemented!(),
+            }
+        }
+    }
+
+    if (status & USBINT_BUS_RESET) != 0 {
+        // blink_partial_value(2, 2);
+        // delay(10);
+        // panic!();
+        status ^= USBINT_BUS_RESET;
+        USBCTRL_SIE_STATUS.clear(SIE_STATUS_BUS_RESET);
+        unsafe { NEW_ADDR.write(0) };
+        USBCTRL_ADDR_ENDP.write(0);
+    }
+
+    if status != 0 {
+        blink_partial_value(3, 2);
+        delay(10);
+        panic!();
+        panic!("Unhandled usb interrupt");
+    }
+}
+
+const DPRAM_SETUP_PACKET: DPRAMPtr<SetupPacket> = DPRAMPtr::new(0);
+
+#[derive(Copy, Clone)]
+pub enum Direction {
+    Out = 0x00,
+    In = 0x80,
+}
+
+impl TryFrom<u8> for Direction {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x00 => Ok(Direction::Out),
+            0x80 => Ok(Direction::In),
+            _ => Err(value),
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum Request {
+    GetStatus = 0x0,
+    ClearFeature = 0x01,
+    SetFeature = 0x03,
+    SetAddress = 0x05,
+    GetDescriptor = 0x06,
+    SetDescriptor = 0x07,
+    GetConfiguration = 0x08,
+    SetConfiguration = 0x09,
+    GetInterface = 0x0A,
+    SetInterface = 0x0B,
+    SyncFrame = 0x0C,
+}
+
+impl TryFrom<u8> for Request {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x0 => Ok(Request::GetStatus),
+            0x01 => Ok(Request::ClearFeature),
+            0x03 => Ok(Request::SetFeature),
+            0x05 => Ok(Request::SetAddress),
+            0x06 => Ok(Request::GetDescriptor),
+            0x07 => Ok(Request::SetDescriptor),
+            0x08 => Ok(Request::GetConfiguration),
+            0x09 => Ok(Request::SetConfiguration),
+            0x0A => Ok(Request::GetInterface),
+            0x0B => Ok(Request::SetInterface),
+            0x0C => Ok(Request::SyncFrame),
+            _ => Err(value),
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct SetupPacket {
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+}
+
+impl SetupPacket {
+    fn request_direction(self) -> Direction {
+        Direction::try_from(self.request_type & 0x80).expect("Direction is either 0x00 or 0x80")
+    }
+
+    fn request(self) -> Result<Request, u8> {
+        Request::try_from(self.request)
+    }
+}
+
+const _: () = if size_of::<SetupPacket>() != 8 {
+    panic!("Incorrect USBSetupPacket size")
+};
+
+const DEVICE_CONFIG: DeviceConfig<'static> = DeviceConfig {
+    device_descriptor: &DeviceDescriptor {
+        bcdUSB: 0x0110,      // USB 1.1 device
+        bDeviceClass: 0,     // Specified in interface descriptor
+        bDeviceSubClass: 0,  // No subclass
+        bDeviceProtocol: 0,  // No protocol
+        bMaxPacketSize0: 64, // Max packet size for ep0
+        idVendor: 0x0000,    // Your vendor id
+        idProduct: 0x0001,   // Your product ID
+        bcdDevice: 0,        // No device revision number
+        manufacturer: Some(StringDescriptorIndex(NonZeroU8::new(1).unwrap())), // Manufacturer string index
+        product: Some(StringDescriptorIndex(NonZeroU8::new(2).unwrap())), // Product string index
+        serial_number: None,                                              // No serial number
+        bNumConfigurations: 1,                                            // One configuration
+    },
+    interface_descriptor: &InterfaceDescriptor {
+        bInterfaceNumber: 0,
+        bAlternateSetting: 0,
+        bNumEndpoints: 2,      // Interface has 2 endpoints
+        bInterfaceClass: 0xff, // Vendor specific endpoint
+        bInterfaceSubClass: 0,
+        bInterfaceProtocol: 0,
+        iInterface: 0,
+    },
+    configuration_descriptor: &ConfigurationDescriptor {
+        wTotalLength: (ConfigurationDescriptor::LENGTH as u16
+            + InterfaceDescriptor::LENGTH as u16
+            + 2 * EndpointDescriptor::LENGTH as u16),
+        bNumInterfaces: 1,
+        bConfigurationValue: 1, // Configuration 1
+        iConfiguration: 0,      // No string
+        bmAttributes: 0xc0,     // attributes: self powered, no remote wakeup
+        bMaxPower: 0x32,        // 100ma
+    },
+    lang_descriptor: [
+        4,    // bLength
+        0x03, // bDescriptorType == String Descriptor
+        0x09, 0x04, // language id = us english
+    ],
+    descriptor_strings: &[
+        "RCoder01's",             // Vendor
+        "worlds worst USB stick", // Product
+    ],
+    endpoints: &[
+        EndpointDescriptor {
+            endpoint_address: Direction::Out as u8 | 0,
+            attributes: TransferType::Control,
+            max_packet_size: 64,
+            interval: 0,
+        },
+        EndpointDescriptor {
+            endpoint_address: Direction::In as u8 | 0,
+            attributes: TransferType::Control,
+            max_packet_size: 64,
+            interval: 0,
+        },
+        EndpointDescriptor {
+            endpoint_address: Direction::Out as u8 | 1,
+            attributes: TransferType::Bulk,
+            max_packet_size: 64,
+            interval: 0,
+        },
+        EndpointDescriptor {
+            endpoint_address: Direction::In as u8 | 2,
+            attributes: TransferType::Bulk,
+            max_packet_size: 64,
+            interval: 0,
+        },
+    ],
+};
+
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct StringDescriptorIndex(NonZeroU8);
+
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum DescriptorType {
+    Device = 0x01,
+    Config = 0x02,
+    String = 0x03,
+    Interface = 0x04,
+    Endpoint = 0x05,
+}
+
+impl TryFrom<u8> for DescriptorType {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(Self::Device),
+            0x02 => Ok(Self::Config),
+            0x03 => Ok(Self::String),
+            0x04 => Ok(Self::Interface),
+            0x05 => Ok(Self::Endpoint),
+            _ => Err(value),
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct DeviceDescriptor {
+    bcdUSB: u16,
+    bDeviceClass: u8,
+    bDeviceSubClass: u8,
+    bDeviceProtocol: u8,
+    bMaxPacketSize0: u8,
+    idVendor: u16,
+    idProduct: u16,
+    bcdDevice: u16,
+    manufacturer: Option<StringDescriptorIndex>,
+    product: Option<StringDescriptorIndex>,
+    serial_number: Option<StringDescriptorIndex>,
+    bNumConfigurations: u8,
+}
+
+macro_rules! write_fn {
+    () => {
+        const LENGTH_USIZE: usize = Self::LENGTH as usize;
+
+        fn write(&self, output: &mut [u8; Self::LENGTH_USIZE]) {
+            output[0] = Self::LENGTH;
+            output[1] = Self::DESCRIPTOR_TYPE as u8;
+            const {
+                if size_of::<Self>() != Self::LENGTH_USIZE - 2 {
+                    panic!()
+                }
+            }
+            let bytes: [u8; size_of::<Self>()] = unsafe { core::mem::transmute(*self) };
+            output[2..].copy_from_slice(&bytes);
+        }
+    };
+}
+
+impl DeviceDescriptor {
+    const LENGTH: u8 = 18;
+    const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Device;
+
+    write_fn!();
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct InterfaceDescriptor {
+    bInterfaceNumber: u8,
+    bAlternateSetting: u8,
+    bNumEndpoints: u8,
+    bInterfaceClass: u8,
+    bInterfaceSubClass: u8,
+    bInterfaceProtocol: u8,
+    iInterface: u8,
+}
+
+impl InterfaceDescriptor {
+    const LENGTH: u8 = 9;
+    const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Interface;
+
+    write_fn!();
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct ConfigurationDescriptor {
+    wTotalLength: u16,
+    bNumInterfaces: u8,
+    bConfigurationValue: u8,
+    iConfiguration: u8,
+    bmAttributes: u8,
+    bMaxPower: u8,
+}
+
+impl ConfigurationDescriptor {
+    const LENGTH: u8 = 9;
+    const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Config;
+
+    write_fn!();
+}
+
+const USB_DIR_IN: u8 = 0x80;
+const USB_DIR_OUT: u8 = 0x00;
+
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum TransferType {
+    Control = 0x0,
+    Isochronous = 0x01,
+    Bulk = 0x2,
+    Interrupt = 0x3,
+}
+
+#[derive(Copy, Clone)]
+pub enum EndpointId {
+    Endpoint0 = 0,
+    Endpoint1 = 1,
+    Endpoint2 = 2,
+    Endpoint3 = 3,
+    Endpoint4 = 4,
+    Endpoint5 = 5,
+    Endpoint6 = 6,
+    Endpoint7 = 7,
+    Endpoint8 = 8,
+    Endpoint9 = 9,
+    Endpoint10 = 10,
+    Endpoint11 = 11,
+    Endpoint12 = 12,
+    Endpoint13 = 13,
+    Endpoint14 = 14,
+    Endpoint15 = 15,
+}
+
+impl EndpointId {
+    pub fn new(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Endpoint0),
+            1 => Some(Self::Endpoint1),
+            2 => Some(Self::Endpoint2),
+            3 => Some(Self::Endpoint3),
+            4 => Some(Self::Endpoint4),
+            5 => Some(Self::Endpoint5),
+            6 => Some(Self::Endpoint6),
+            7 => Some(Self::Endpoint7),
+            8 => Some(Self::Endpoint8),
+            9 => Some(Self::Endpoint9),
+            10 => Some(Self::Endpoint10),
+            11 => Some(Self::Endpoint11),
+            12 => Some(Self::Endpoint12),
+            13 => Some(Self::Endpoint13),
+            14 => Some(Self::Endpoint14),
+            15 => Some(Self::Endpoint15),
+            _ => None,
+        }
+    }
+    pub const fn is_zero(self) -> bool {
+        matches!(self, Self::Endpoint0)
+    }
+}
+
+pub const fn endpoint_ctrl_register(
+    endpoint: EndpointId,
+    direction: Direction,
+) -> Option<DPRAMPtr<u32>> {
+    const BASE: DPRAMPtr<u32> = DPRAMPtr::new(0);
+    let offset = match direction {
+        Direction::Out => 1,
+        Direction::In => 0,
+    };
+    match endpoint.is_zero() {
+        true => None,
+        false => Some(BASE.offset((endpoint as u8 * 2 + offset) as _)),
+    }
+}
+
+pub const fn endpoint_buffer_ctrl_register(
+    endpoint: EndpointId,
+    direction: Direction,
+) -> DPRAMPtr<u32> {
+    const BASE: DPRAMPtr<u32> = DPRAMPtr::new(0x80);
+    let offset = match direction {
+        Direction::Out => 1,
+        Direction::In => 0,
+    };
+    BASE.offset((endpoint as u8 * 2 + offset) as _)
+}
+
+pub const fn endpoint_buffer(endpoint: EndpointId, direction: Direction) -> DPRAMPtr<[u8; 64]> {
+    const BASE: DPRAMPtr<[u8; 64]> = DPRAMPtr::new(0x100);
+    if matches!(endpoint, EndpointId::Endpoint0) {
+        return BASE;
+    }
+    let offset = match direction {
+        Direction::Out => 1,
+        Direction::In => 0,
+    };
+    BASE.offset((endpoint as u8 * 2 + offset) as _)
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct EndpointDescriptor {
+    endpoint_address: u8,
+    attributes: TransferType,
+    max_packet_size: u16,
+    interval: u8,
+}
+
+impl EndpointDescriptor {
+    const LENGTH: u8 = 7;
+    const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Endpoint;
+
+    write_fn!();
+
+    fn endpoint(self) -> EndpointId {
+        EndpointId::new(self.endpoint_address & 0x7F).expect("id should be within bounds")
+    }
+
+    fn direction(self) -> Direction {
+        (self.endpoint_address & 0x80)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!())
+    }
+}
+
+#[derive(Clone)]
+struct DeviceConfig<'a> {
+    device_descriptor: &'a DeviceDescriptor,
+    interface_descriptor: &'a InterfaceDescriptor,
+    configuration_descriptor: &'a ConfigurationDescriptor,
+    lang_descriptor: [u8; 4],
+    descriptor_strings: &'a [&'a str],
+    endpoints: &'a [EndpointDescriptor],
+}
+
+impl DeviceConfig<'_> {
+    fn configure_endpoints(&self) {
+        assert!(self.endpoints.len() < 16);
+        for endpoint in self.endpoints {
+            let id = EndpointId::new(endpoint.endpoint_address & 0x7F)
+                .expect("Should not have more than 16 endpoints");
+            let dir = Direction::try_from(endpoint.endpoint_address & 0x80)
+                .expect("Direction is either 0x00 or 0x80");
+            let dpram_offset = endpoint_buffer(id, dir).byte_offset;
+            const TRANSFER_TYPE_BITS: u32 = 26;
+            const INTERRUPT_EVERY_2_BUFFERS: u32 = 1 << 28;
+            const INTERRUPT_EVERY_BUFFER: u32 = 1 << 29;
+            const DOUBLE_BUFFERED: u32 = 1 << 30;
+            const ENABLE: u32 = 1 << 31;
+            if let Some(register) = endpoint_ctrl_register(id, dir) {
+                register.write(
+                    ENABLE
+                        | (DOUBLE_BUFFERED * 0)
+                        | INTERRUPT_EVERY_BUFFER
+                        | (((endpoint.attributes as u8 & 0b11) as u32) << TRANSFER_TYPE_BITS)
+                        | dpram_offset as u32,
+                );
+            }
+        }
+    }
 }

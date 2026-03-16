@@ -1,41 +1,82 @@
 #![no_std]
 #![no_main]
 
+use core::ops::RangeInclusive;
+
 use crate::{
+    clocks::{
+        CLK_REF_CTRL, CLK_REF_SELECTED, CLK_SYS_CTRL, CLK_SYS_SELECTED, CLK_USB_CTRL, PLL_SYS,
+        PLL_USB, PllParams, ROSC_COUNT, enable_usb_clock,
+        freq_counters::{ClockToTest, test_clock_khz},
+        init_xosc, switch_sys_clock_to_xosc,
+    },
     common::nop_volatile,
     gpio::{
         DRIVE_STRENGTH_12MA, LED_PIN, PULL_DOWN_ENABLE, SIO, gpio_ctrl_reg, gpio_output_clear,
         gpio_output_enable, gpio_output_set, gpio_output_xor, pads_gpio_reg,
     },
     trap::init_traps,
-    usb::init_usb_blocking,
+    usb::init_usb_as_device,
 };
 
+mod clocks;
 mod common;
 mod gpio;
+mod resets;
 mod startup;
 mod trap;
 mod usb;
 
-#[unsafe(no_mangle)]
+macro_rules! assert_eq {
+    ($a: expr, $b: expr, $msg: expr) => {
+        if ($a) != ($b) {
+            panic!($msg);
+        }
+    };
+    ($a: expr, $b: expr) => {
+        assert_eq!($a, $b, "");
+    };
+}
+
+macro_rules! assert {
+    ($val: expr, $msg: expr) => {
+        if !($val) {
+            panic!($msg);
+        }
+    };
+    ($val: expr) => {
+        assert!($val, "");
+    };
+}
+
 pub extern "C" fn main() -> ! {
     unsafe {
         gpio_ctrl_reg(LED_PIN).write_volatile(SIO);
         pads_gpio_reg(LED_PIN).write_volatile(DRIVE_STRENGTH_12MA | PULL_DOWN_ENABLE);
         gpio_output_enable(LED_PIN);
     }
+
+    init_xosc();
+    switch_sys_clock_to_xosc();
+    enable_usb_clock();
+
     init_traps();
-    // init_usb_blocking();
+    init_usb_as_device();
 
-    const RANDOM_RAM: *mut u32 = 0x2000_0004 as _;
-    unsafe { RANDOM_RAM.write_volatile(0b1001_0110) };
-    let val = unsafe { RANDOM_RAM.read_volatile() };
+    loop {
+        // gpio_output_xor(LED_PIN);
+        delay(10);
+    }
+}
 
-    blink_partial_value(val as _, 4);
-
-    unsafe { (0x2000_0005 as *const u32).read_volatile() };
-
-    loop {}
+fn extract_bits(word: u32, range: RangeInclusive<u32>) -> u32 {
+    assert!(*range.end() <= 31);
+    assert!(range.end() >= range.start());
+    if *range.end() == 31 {
+        word >> range.start()
+    } else {
+        (word & ((1 << (range.end() + 1)) - 1)) >> range.start()
+    }
 }
 
 fn blink_value(val: usize) {
@@ -75,11 +116,24 @@ fn blink_1() {
 }
 
 fn delay(units: u32) {
-    let count = units * 3 << 16;
+    let count = (units * 3) << 20;
     for _ in 0..count {
         nop_volatile();
     }
 }
+
+// fn delay(units: u32) {
+//     for _ in 0..(units * 3) {
+//         delay_cycles(0xFFFF);
+//     }
+// }
+//
+// fn delay_cycles(cycles: u16) {
+//     ROSC_COUNT.write(cycles as u32);
+//     while ROSC_COUNT.read() != 0 {
+//         nop_volatile();
+//     }
+// }
 
 #[panic_handler]
 fn panic_handler(_: &core::panic::PanicInfo) -> ! {
@@ -89,7 +143,7 @@ fn panic_handler(_: &core::panic::PanicInfo) -> ! {
         gpio_output_enable(LED_PIN);
     }
 
-    const PERIOD: usize = 1 << 18;
+    const PERIOD: usize = 1 << 21;
     'outer: loop {
         gpio_output_xor(LED_PIN);
         let mut r = PERIOD;

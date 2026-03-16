@@ -1,10 +1,13 @@
-#!/usr/bin/env -S cargo +nightly -Zscript --quiet
+#!/usr/bin/env -S cargo +nightly -Zscript --quiet --config build.target=\"x86_64-unknown-linux-gnu\"
 ---cargo
+[package]
+edition = "2024"
+
 [profile.dev]
 opt-level = 3
 
 [dependencies]
-clap = { version = "4.5.53", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive"] }
 anyhow = "1.0"
 ---
 use anyhow::{Context, Result};
