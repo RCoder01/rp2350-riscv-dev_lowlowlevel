@@ -4,16 +4,11 @@
 use core::ops::RangeInclusive;
 
 use crate::{
-    clocks::{
-        CLK_REF_CTRL, CLK_REF_SELECTED, CLK_SYS_CTRL, CLK_SYS_SELECTED, CLK_USB_CTRL, PLL_SYS,
-        PLL_USB, PllParams, ROSC_COUNT, enable_usb_clock,
-        freq_counters::{ClockToTest, test_clock_khz},
-        init_xosc, switch_sys_clock_to_xosc,
-    },
+    clocks::{enable_usb_clock, init_xosc, switch_sys_clock_to_xosc},
     common::nop_volatile,
     gpio::{
         DRIVE_STRENGTH_12MA, LED_PIN, PULL_DOWN_ENABLE, SIO, gpio_ctrl_reg, gpio_output_clear,
-        gpio_output_enable, gpio_output_set, gpio_output_xor, pads_gpio_reg,
+        gpio_output_enable, gpio_output_xor, pads_gpio_reg,
     },
     trap::init_traps,
     usb::init_usb_as_device,
@@ -27,6 +22,7 @@ mod startup;
 mod trap;
 mod usb;
 
+#[macro_export]
 macro_rules! assert_eq {
     ($a: expr, $b: expr, $msg: expr) => {
         if ($a) != ($b) {
@@ -38,6 +34,7 @@ macro_rules! assert_eq {
     };
 }
 
+#[macro_export]
 macro_rules! assert {
     ($val: expr, $msg: expr) => {
         if !($val) {

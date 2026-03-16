@@ -1,6 +1,7 @@
 use core::ptr;
 
 use crate::{
+    assert, assert_eq,
     common::{AliasedRegister, nop_volatile},
     extract_bits,
     resets::{RESETS_RESET, RESETS_RESET_DONE},

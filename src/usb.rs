@@ -1,7 +1,7 @@
 use core::{iter::zip, marker::PhantomData, num::NonZeroU8, ptr};
 
 use crate::{
-    blink_partial_value,
+    assert, blink_partial_value,
     clocks::{PLL_SYS_PARAMS, PLL_USB_PARAMS},
     common::{AliasedRegister, csr_clear, csr_set, nop_volatile},
     delay,
