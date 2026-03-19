@@ -1,11 +1,14 @@
+#![allow(non_snake_case)]
 use core::{iter::zip, marker::PhantomData, num::NonZeroU8, ptr};
 
 use crate::{
-    assert, blink_partial_value,
+    assert, assert_eq, blink_partial_value,
     clocks::{PLL_SYS_PARAMS, PLL_USB_PARAMS},
-    common::{AliasedRegister, csr_clear, csr_set, nop_volatile},
-    delay,
+    common::{AliasedRegister, copy_const, csr_clear, csr_set, nop_volatile},
+    const_for, delay,
     resets::{RESETS_RESET, RESETS_RESET_DONE},
+    trap::{RVCSR_MEIEA, RVCSR_MEIFA},
+    usb::cdc::{AbstractControlManagement, CallManagement, CommunicationsDescriptor, Union},
 };
 
 const RESETS_RESET_USBCTRL: u32 = 28;
@@ -101,8 +104,6 @@ fn wait_sync_usb_dpsram() {
     }
 }
 
-const RVCSR_MEIFA: u32 = 0xBE2;
-const RVCSR_MEIEA: u32 = 0xBE0;
 const USBCTRL_IRQ: u32 = 14;
 
 const USBINT_BUF_STATUS: u32 = 1 << 4;
@@ -153,7 +154,7 @@ pub fn init_usb_as_device() {
     // and when a setup packet is received
     USBCTRL_INTE.write(USBINT_BUF_STATUS | USBINT_BUS_RESET | USBINT_SETUP_REQ | 0);
 
-    DEVICE_CONFIG.configure_endpoints();
+    // DEVICE_CONFIG.configure_endpoints();
 
     const SIE_PULLUP_ENABLE: u32 = 1 << 16;
     // Present full speed device by enabling pull up on DP
@@ -189,46 +190,67 @@ fn send_device_descriptor(packet: &SetupPacket) {
     );
 }
 
-fn send_config_descriptor(packet: &SetupPacket) {
-    const WRITE_SIZE: usize = {
-        let mut i = 0;
-        let mut len = ConfigurationDescriptor::LENGTH_USIZE + InterfaceDescriptor::LENGTH_USIZE;
-        while i < DEVICE_CONFIG.endpoints.len() {
-            if (DEVICE_CONFIG.endpoints[i].endpoint_address & 0x7F) != 0 {
-                len += EndpointDescriptor::LENGTH_USIZE;
+pub const FLAG: DPRAMPtr<u8> = DPRAMPtr::new((USBCTRL_DPRAM_LEN - 2) as u16);
+const EP0_BUF_STATUS: DPRAMPtr<u8> = DPRAMPtr::new((USBCTRL_DPRAM_LEN - 1) as u16);
+
+const CONFIG_DESC_SIZE: usize = DEVICE_CONFIG.configuration_descriptor.wTotalLength as usize;
+fn config_desc_packet(total_len: usize, part: usize) -> &'static [u8] {
+    const fn split<'a, const N: usize>(slice: &mut &'a mut [u8]) -> &'a mut [u8; N] {
+        let copy = core::mem::replace(slice, &mut []);
+        let (front, back) = copy.split_at_mut(N);
+        *slice = back;
+        front.as_mut_array().expect("sizes should match")
+    }
+
+    const CONFIG_DESC_BUF: [u8; CONFIG_DESC_SIZE] = {
+        let mut buf = [0; CONFIG_DESC_SIZE];
+        let rem = &mut buf.as_mut_slice();
+        DEVICE_CONFIG.configuration_descriptor.write(split(rem));
+        INTERFACE_ASSOCIATION_DESCRIPTORS[0].write(split(rem));
+        INTERFACE_DESCRIPTORS[0].write(split(rem));
+        const_for!(comms_desc in COMMUNICATIONS_DESCRIPTORS => {
+            let Ok(_) = comms_desc.try_write(rem) else {
+                panic!("should be large enough");
+            };
+        });
+        const_for!(endpoint in DEVICE_CONFIG.endpoints => {
+            if matches!(endpoint.endpoint(), EndpointId::Endpoint1) {
+                endpoint.write(split(rem));
             }
-            i += 1;
-        }
-        len
+        });
+        INTERFACE_DESCRIPTORS[1].write(split(rem));
+        const_for!(endpoint in DEVICE_CONFIG.endpoints => {
+            if matches!(endpoint.endpoint(), EndpointId::Endpoint2) {
+                endpoint.write(split(rem));
+            }
+        });
+        assert_eq!(rem.len(), 0);
+        buf
     };
-
-    fn split<'a, const N: usize>(slice: &mut &'a mut [u8]) -> &'a mut [u8; N] {
-        let first = slice.split_off_mut(..N).expect("buf should be long enough");
-        first.try_into().expect("slice has length N")
+    let start = part * 64;
+    let end = (start + 64).min(total_len).min(CONFIG_DESC_BUF.len());
+    if end < start {
+        &[]
+    } else {
+        &CONFIG_DESC_BUF.as_slice()[start..end]
     }
+}
 
-    let mut buf = [0; WRITE_SIZE];
-    let mut slice = buf.as_mut_slice();
-    DEVICE_CONFIG
-        .configuration_descriptor
-        .write(split(&mut slice));
-    DEVICE_CONFIG.interface_descriptor.write(split(&mut slice));
-    for endpoint in DEVICE_CONFIG.endpoints {
-        if !matches!(endpoint.endpoint(), EndpointId::Endpoint0) {
-            endpoint.write(split(&mut slice));
+fn send_config_descriptor(packet: &SetupPacket, part_index: usize) {
+    let part = config_desc_packet(packet.length as usize, part_index);
+    if part.len() == 64 {
+        EP0_BUFFER.write(part.try_into().unwrap());
+        EP0_BUF_STATUS.write((part_index + 1) as u8);
+    } else {
+        for (i, b) in part.iter().copied().enumerate() {
+            EP0_BUFFER.cast().offset(i as _).write(b)
         }
+        EP0_BUF_STATUS.write(0);
     }
-
-    const BUFFER_MIN: usize = if WRITE_SIZE < 64 { WRITE_SIZE } else { 64 };
-    const PTR: DPRAMPtr<[u8; BUFFER_MIN]> =
-        endpoint_buffer(EndpointId::Endpoint0, Direction::In).cast();
-    PTR.write(buf.as_slice().try_into().unwrap());
-    let len = BUFFER_MIN.min(packet.length as usize);
     wait_sync_usb_dpsram();
-
     const CTRL: DPRAMPtr<u32> = endpoint_buffer_ctrl_register(EndpointId::Endpoint0, Direction::In);
     let pid = (!CTRL.read()) & BUFFER_0_DATA_PID;
-    let ctrl_val = len as u32 | BUFFER_0_AVAILABLE | BUFFER_0_FULL | pid;
+    let ctrl_val = part.len() as u32 | BUFFER_0_AVAILABLE | BUFFER_0_FULL | pid;
     CTRL.write(ctrl_val);
 }
 
@@ -240,7 +262,11 @@ fn send_string_descriptor(packet: &SetupPacket) {
         PTR.cast().write(buf);
         buf.len() as u8
     } else {
-        let str = DEVICE_CONFIG.descriptor_strings[i as usize - 1];
+        let str = DEVICE_CONFIG
+            .descriptor_strings
+            .get(i as usize - 1)
+            .copied()
+            .unwrap_or("Unknown string");
         let str_len = str.encode_utf16().count() * size_of::<u16>();
         let len = (str_len + 2).min(64) as u8;
         let mut buf = [0u16; 32];
@@ -260,16 +286,24 @@ fn send_string_descriptor(packet: &SetupPacket) {
     CTRL.write(ctrl_val);
 }
 
+fn send_device_qualifier_descriptor(_packet: &SetupPacket) {
+    let len = 0;
+    const CTRL: DPRAMPtr<u32> = endpoint_buffer_ctrl_register(EndpointId::Endpoint0, Direction::In);
+    let pid = (!CTRL.read()) & BUFFER_0_DATA_PID;
+    let ctrl_val = len as u32 | BUFFER_0_AVAILABLE | BUFFER_0_FULL | pid;
+    CTRL.write(ctrl_val);
+}
+
 const SIE_STATUS_SETUP_REC: u32 = 1 << 17;
 const SIE_STATUS_BUS_RESET: u32 = 1 << 19;
 pub fn usb_trap_handler() {
     const NEW_ADDR: *mut u8 = 0x20000000 as *mut u8;
     let mut status = USBCTRL_INTS.read();
+    if FLAG.read() != 0 {
+        FLAG.write(FLAG.read() + 1);
+    }
 
     if (status & USBINT_SETUP_REQ) != 0 {
-        // blink_partial_value(0, 2);
-        // delay(10);
-        // panic!();
         status ^= USBINT_SETUP_REQ;
         USBCTRL_SIE_STATUS.clear(SIE_STATUS_SETUP_REC);
         // set curr pid to 0 so next pid will be 1
@@ -293,6 +327,15 @@ pub fn usb_trap_handler() {
                     let pid = (!CTRL_REG.read()) & BUFFER_0_DATA_PID;
                     CTRL_REG.write(pid | BUFFER_0_AVAILABLE | len);
                 }
+                Err(0x20) => {
+                    // set line coding request
+                    acknowledge_out_request();
+                    FLAG.write(1);
+                }
+                Err(0x22) => {
+                    // set control line state
+                    acknowledge_out_request();
+                }
                 _ => {
                     acknowledge_out_request();
                 }
@@ -302,8 +345,11 @@ pub fn usb_trap_handler() {
                     Ok(DescriptorType::Device) => {
                         send_device_descriptor(&packet);
                     }
-                    Ok(DescriptorType::Config) => send_config_descriptor(&packet),
+                    Ok(DescriptorType::Config) => send_config_descriptor(&packet, 0),
                     Ok(DescriptorType::String) => send_string_descriptor(&packet),
+                    Ok(DescriptorType::DeviceQualifier) => {
+                        send_device_qualifier_descriptor(&packet)
+                    }
                     _ => todo!(),
                 },
                 _ => todo!(),
@@ -312,17 +358,12 @@ pub fn usb_trap_handler() {
     }
 
     if (status & USBINT_BUF_STATUS) != 0 {
-        // blink_partial_value(1, 2);
-        // delay(10);
-        // panic!();
         status ^= USBINT_BUF_STATUS;
         let buffers = USBCTRL_BUF_STATUS.read();
         let mut remaining = buffers;
 
         while remaining != 0 {
             let bit = remaining.trailing_zeros();
-            // blink_partial_value(bit as _, 2);
-            // delay(10);
             USBCTRL_BUF_STATUS.clear(1 << bit);
             remaining &= !(1 << bit);
 
@@ -340,17 +381,32 @@ pub fn usb_trap_handler() {
                         unsafe { NEW_ADDR.write(new_addr & 0x7F) };
                         USBCTRL_ADDR_ENDP.write(new_addr as u32);
                     } else {
-                        let pid = (!EP0_OUT_BUFFER_CTRL_REG.read()) & BUFFER_0_DATA_PID;
-                        EP0_OUT_BUFFER_CTRL_REG.write(pid | BUFFER_0_AVAILABLE);
+                        let status = EP0_BUF_STATUS.read();
+                        if status != 0 {
+                            let setup = DPRAM_SETUP_PACKET.read();
+                            send_config_descriptor(&setup, status as usize);
+                        } else {
+                            let pid = (!EP0_OUT_BUFFER_CTRL_REG.read()) & BUFFER_0_DATA_PID;
+                            EP0_OUT_BUFFER_CTRL_REG.write(pid | BUFFER_0_AVAILABLE);
+                        }
                     }
                 }
-                (EndpointId::Endpoint1, Direction::Out) => {
-                    // send on ep2_in
+                (EndpointId::Endpoint1, Direction::In) => {
                     todo!()
                 }
                 (EndpointId::Endpoint2, Direction::In) => {
-                    // send on ep1_out
                     todo!()
+                }
+                (EndpointId::Endpoint2, Direction::Out) => {
+                    todo!()
+                    // let val = endpoint_buffer(EndpointId::Endpoint2, Direction::Out).read()[0];
+                    // endpoint_buffer(EndpointId::Endpoint2, Direction::In)
+                    //     .cast()
+                    //     .write(val);
+                    // const CTRL_REG: DPRAMPtr<u32> =
+                    //     endpoint_buffer_ctrl_register(EndpointId::Endpoint2, Direction::In);
+                    // let pid = (!CTRL_REG.read()) & BUFFER_0_DATA_PID;
+                    // CTRL_REG.write(pid | BUFFER_0_AVAILABLE | BUFFER_0_FULL);
                 }
                 _ => unimplemented!(),
             }
@@ -358,9 +414,6 @@ pub fn usb_trap_handler() {
     }
 
     if (status & USBINT_BUS_RESET) != 0 {
-        // blink_partial_value(2, 2);
-        // delay(10);
-        // panic!();
         status ^= USBINT_BUS_RESET;
         USBCTRL_SIE_STATUS.clear(SIE_STATUS_BUS_RESET);
         unsafe { NEW_ADDR.write(0) };
@@ -370,7 +423,6 @@ pub fn usb_trap_handler() {
     if status != 0 {
         blink_partial_value(3, 2);
         delay(10);
-        panic!();
         panic!("Unhandled usb interrupt");
     }
 }
@@ -456,12 +508,91 @@ const _: () = if size_of::<SetupPacket>() != 8 {
     panic!("Incorrect USBSetupPacket size")
 };
 
+const INTERFACE_DESCRIPTORS: [InterfaceDescriptor; 2] = [
+    InterfaceDescriptor {
+        bInterfaceNumber: 0,
+        bAlternateSetting: 0,
+        bNumEndpoints: 1,
+        bInterfaceClass: 0x02,    // Communications and CDC Control
+        bInterfaceSubClass: 0x02, // Abstract Control Model
+        bInterfaceProtocol: 0,
+        iInterface: 4,
+    },
+    InterfaceDescriptor {
+        bInterfaceNumber: 1,
+        bAlternateSetting: 0,
+        bNumEndpoints: 2,
+        bInterfaceClass: 0x0A, // CDC-Data
+        bInterfaceSubClass: 0x00,
+        bInterfaceProtocol: 0x00,
+        iInterface: 0,
+    },
+];
+
+const INTERFACE_ASSOCIATION_DESCRIPTORS: [InterfaceAssociationDescriptor; 1] =
+    [InterfaceAssociationDescriptor {
+        bFirstInterface: 0,
+        bInterfaceCount: 2,
+        bFunctionClass: 0x02, // Communications and CDC Control
+        bFunctionSubClass: 0x02,
+        bFunctionProtocol: 0,
+        iFunction: 0,
+    }];
+
+const COMMUNICATIONS_DESCRIPTORS: [CommunicationsDescriptor; 4] = [
+    CommunicationsDescriptor::Header,
+    CommunicationsDescriptor::CallManagement(CallManagement {
+        bmCapabilities: 0x00,
+        data_interface: 0x01,
+    }),
+    CommunicationsDescriptor::AbstractControlManagement(AbstractControlManagement {
+        bmCapabilities: 0x06,
+    }),
+    CommunicationsDescriptor::Union(Union {
+        control_interface: 0,
+        subordinate_interface: 1,
+    }),
+];
+
+const ENDPOINTS: [EndpointDescriptor; 5] = [
+    EndpointDescriptor {
+        endpoint_address: Direction::Out as u8 | 0,
+        attributes: TransferType::Control,
+        max_packet_size: 64,
+        interval: 0,
+    },
+    EndpointDescriptor {
+        endpoint_address: Direction::In as u8 | 0,
+        attributes: TransferType::Control,
+        max_packet_size: 64,
+        interval: 0,
+    },
+    EndpointDescriptor {
+        endpoint_address: Direction::In as u8 | 1,
+        attributes: TransferType::Interrupt,
+        max_packet_size: 8,
+        interval: 1,
+    },
+    EndpointDescriptor {
+        endpoint_address: Direction::In as u8 | 2,
+        attributes: TransferType::Bulk,
+        max_packet_size: 64,
+        interval: 0,
+    },
+    EndpointDescriptor {
+        endpoint_address: Direction::Out as u8 | 2,
+        attributes: TransferType::Bulk,
+        max_packet_size: 64,
+        interval: 0,
+    },
+];
+
 const DEVICE_CONFIG: DeviceConfig<'static> = DeviceConfig {
     device_descriptor: &DeviceDescriptor {
-        bcdUSB: 0x0110,      // USB 1.1 device
-        bDeviceClass: 0,     // Specified in interface descriptor
-        bDeviceSubClass: 0,  // No subclass
-        bDeviceProtocol: 0,  // No protocol
+        bcdUSB: 0x0200,      // USB 2.0 device
+        bDeviceClass: 0xEF,  // Misc
+        bDeviceSubClass: 2,  // No subclass
+        bDeviceProtocol: 1,  // Interface association descriptor
         bMaxPacketSize0: 64, // Max packet size for ep0
         idVendor: 0x0000,    // Your vendor id
         idProduct: 0x0001,   // Your product ID
@@ -471,20 +602,20 @@ const DEVICE_CONFIG: DeviceConfig<'static> = DeviceConfig {
         serial_number: None,                                              // No serial number
         bNumConfigurations: 1,                                            // One configuration
     },
-    interface_descriptor: &InterfaceDescriptor {
-        bInterfaceNumber: 0,
-        bAlternateSetting: 0,
-        bNumEndpoints: 2,      // Interface has 2 endpoints
-        bInterfaceClass: 0xff, // Vendor specific endpoint
-        bInterfaceSubClass: 0,
-        bInterfaceProtocol: 0,
-        iInterface: 0,
-    },
     configuration_descriptor: &ConfigurationDescriptor {
         wTotalLength: (ConfigurationDescriptor::LENGTH as u16
-            + InterfaceDescriptor::LENGTH as u16
-            + 2 * EndpointDescriptor::LENGTH as u16),
-        bNumInterfaces: 1,
+            + (INTERFACE_DESCRIPTORS.len() * InterfaceDescriptor::LENGTH_USIZE) as u16
+            + (INTERFACE_ASSOCIATION_DESCRIPTORS.len()
+                * InterfaceAssociationDescriptor::LENGTH_USIZE) as u16
+            + ((ENDPOINTS.len() - 2) * EndpointDescriptor::LENGTH_USIZE) as u16
+            + {
+                let mut sum = 0;
+                const_for!(desc in COMMUNICATIONS_DESCRIPTORS => {
+                    sum += desc.length() as u16;
+                });
+                sum
+            }),
+        bNumInterfaces: INTERFACE_DESCRIPTORS.len() as u8,
         bConfigurationValue: 1, // Configuration 1
         iConfiguration: 0,      // No string
         bmAttributes: 0xc0,     // attributes: self powered, no remote wakeup
@@ -499,32 +630,7 @@ const DEVICE_CONFIG: DeviceConfig<'static> = DeviceConfig {
         "RCoder01's",             // Vendor
         "worlds worst USB stick", // Product
     ],
-    endpoints: &[
-        EndpointDescriptor {
-            endpoint_address: Direction::Out as u8 | 0,
-            attributes: TransferType::Control,
-            max_packet_size: 64,
-            interval: 0,
-        },
-        EndpointDescriptor {
-            endpoint_address: Direction::In as u8 | 0,
-            attributes: TransferType::Control,
-            max_packet_size: 64,
-            interval: 0,
-        },
-        EndpointDescriptor {
-            endpoint_address: Direction::Out as u8 | 1,
-            attributes: TransferType::Bulk,
-            max_packet_size: 64,
-            interval: 0,
-        },
-        EndpointDescriptor {
-            endpoint_address: Direction::In as u8 | 2,
-            attributes: TransferType::Bulk,
-            max_packet_size: 64,
-            interval: 0,
-        },
-    ],
+    endpoints: &ENDPOINTS,
 };
 
 #[repr(transparent)]
@@ -539,6 +645,9 @@ enum DescriptorType {
     String = 0x03,
     Interface = 0x04,
     Endpoint = 0x05,
+    DeviceQualifier = 0x06,
+    InterfaceAssociation = 0x0B,
+    CSInterface = 0x24,
 }
 
 impl TryFrom<u8> for DescriptorType {
@@ -551,6 +660,9 @@ impl TryFrom<u8> for DescriptorType {
             0x03 => Ok(Self::String),
             0x04 => Ok(Self::Interface),
             0x05 => Ok(Self::Endpoint),
+            0x06 => Ok(Self::DeviceQualifier),
+            0x0B => Ok(Self::InterfaceAssociation),
+            0x24 => Ok(Self::CSInterface),
             _ => Err(value),
         }
     }
@@ -575,19 +687,51 @@ struct DeviceDescriptor {
 
 macro_rules! write_fn {
     () => {
+        const fn try_write(&self, output: &mut [u8]) -> Result<(), ()> {
+            let len = self.length() as usize;
+            output[0] = self.length();
+            output[1] = self.descriptor_type();
+            if output.len() < len - 2 {
+                return Err(());
+            }
+            copy_const(output, 2..len, self.as_slice());
+            Ok(())
+        }
+    };
+}
+
+macro_rules! write_fn_const {
+    () => {
         const LENGTH_USIZE: usize = Self::LENGTH as usize;
 
-        fn write(&self, output: &mut [u8; Self::LENGTH_USIZE]) {
-            output[0] = Self::LENGTH;
-            output[1] = Self::DESCRIPTOR_TYPE as u8;
+        const fn length(&self) -> u8 {
+            Self::LENGTH
+        }
+
+        const fn descriptor_type(&self) -> u8 {
+            Self::DESCRIPTOR_TYPE as u8
+        }
+
+        const fn as_slice(&self) -> &[u8] {
+            unsafe {
+                core::slice::from_raw_parts(core::ptr::from_ref(self).cast(), size_of::<Self>())
+            }
+        }
+
+        const fn write(&self, output: &mut [u8; Self::LENGTH_USIZE]) {
             const {
                 if size_of::<Self>() != Self::LENGTH_USIZE - 2 {
                     panic!()
                 }
             }
+            output[0] = self.length();
+            output[1] = self.descriptor_type();
             let bytes: [u8; size_of::<Self>()] = unsafe { core::mem::transmute(*self) };
-            output[2..].copy_from_slice(&bytes);
+            let len = output.len();
+            copy_const(output, 2..len, &bytes);
         }
+
+        write_fn!();
     };
 }
 
@@ -595,7 +739,7 @@ impl DeviceDescriptor {
     const LENGTH: u8 = 18;
     const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Device;
 
-    write_fn!();
+    write_fn_const!();
 }
 
 #[repr(C, packed)]
@@ -614,7 +758,25 @@ impl InterfaceDescriptor {
     const LENGTH: u8 = 9;
     const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Interface;
 
-    write_fn!();
+    write_fn_const!();
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct InterfaceAssociationDescriptor {
+    bFirstInterface: u8,
+    bInterfaceCount: u8,
+    bFunctionClass: u8,
+    bFunctionSubClass: u8,
+    bFunctionProtocol: u8,
+    iFunction: u8,
+}
+
+impl InterfaceAssociationDescriptor {
+    const LENGTH: u8 = 8;
+    const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::InterfaceAssociation;
+
+    write_fn_const!();
 }
 
 #[repr(C, packed)]
@@ -632,7 +794,7 @@ impl ConfigurationDescriptor {
     const LENGTH: u8 = 9;
     const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Config;
 
-    write_fn!();
+    write_fn_const!();
 }
 
 const USB_DIR_IN: u8 = 0x80;
@@ -668,7 +830,7 @@ pub enum EndpointId {
 }
 
 impl EndpointId {
-    pub fn new(id: u8) -> Option<Self> {
+    pub const fn new(id: u8) -> Option<Self> {
         match id {
             0 => Some(Self::Endpoint0),
             1 => Some(Self::Endpoint1),
@@ -746,23 +908,22 @@ impl EndpointDescriptor {
     const LENGTH: u8 = 7;
     const DESCRIPTOR_TYPE: DescriptorType = DescriptorType::Endpoint;
 
-    write_fn!();
+    write_fn_const!();
 
-    fn endpoint(self) -> EndpointId {
+    const fn endpoint(self) -> EndpointId {
         EndpointId::new(self.endpoint_address & 0x7F).expect("id should be within bounds")
     }
 
     fn direction(self) -> Direction {
         (self.endpoint_address & 0x80)
             .try_into()
-            .unwrap_or_else(|_| unreachable!())
+            .expect("unreachable")
     }
 }
 
 #[derive(Clone)]
 struct DeviceConfig<'a> {
     device_descriptor: &'a DeviceDescriptor,
-    interface_descriptor: &'a InterfaceDescriptor,
     configuration_descriptor: &'a ConfigurationDescriptor,
     lang_descriptor: [u8; 4],
     descriptor_strings: &'a [&'a str],
@@ -792,6 +953,96 @@ impl DeviceConfig<'_> {
                         | dpram_offset as u32,
                 );
             }
+        }
+    }
+}
+
+mod cdc {
+    use crate::{common::copy_const, usb::DescriptorType};
+
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    pub struct CallManagement {
+        pub bmCapabilities: u8,
+        pub data_interface: u8,
+    }
+
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    pub struct AbstractControlManagement {
+        pub bmCapabilities: u8,
+    }
+
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    pub struct Union {
+        pub control_interface: u8,
+        pub subordinate_interface: u8,
+    }
+
+    #[derive(Clone, Copy)]
+    pub enum CommunicationsDescriptor {
+        Header,
+        CallManagement(CallManagement),
+        AbstractControlManagement(AbstractControlManagement),
+        Union(Union),
+    }
+
+    impl CommunicationsDescriptor {
+        pub const fn length(&self) -> u8 {
+            match self {
+                Self::Header => 5,
+                Self::CallManagement(_) => 5,
+                Self::AbstractControlManagement(_) => 4,
+                Self::Union(_) => 5,
+            }
+        }
+
+        pub const fn descriptor_type(&self) -> u8 {
+            DescriptorType::CSInterface as u8
+        }
+
+        pub const fn descriptor_subtype(&self) -> u8 {
+            match self {
+                Self::Header => 0x00,
+                Self::CallManagement(_) => 0x01,
+                Self::AbstractControlManagement(_) => 0x02,
+                Self::Union(_) => 0x06,
+            }
+        }
+
+        pub const fn as_slice(&self) -> &[u8] {
+            macro_rules! to_slice {
+                ($name: ident, $type: ident) => {
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            core::ptr::from_ref($name).cast(),
+                            size_of::<$type>(),
+                        )
+                    }
+                };
+            }
+            match self {
+                Self::Header => const { 0x0120u16.to_le_bytes() }.as_slice(),
+                Self::CallManagement(cm) => to_slice!(cm, CallManagement),
+                Self::AbstractControlManagement(acm) => to_slice!(acm, AbstractControlManagement),
+                Self::Union(union) => to_slice!(union, Union),
+            }
+        }
+
+        pub const fn try_write(&self, output: &mut &mut [u8]) -> Result<(), ()> {
+            let len = self.length() as usize;
+            if output.len() < len {
+                return Err(());
+            }
+            let slice = core::mem::replace(output, &mut []);
+            let (start, end) = slice.split_at_mut(len);
+            *output = end;
+            start[0] = self.length();
+            start[1] = self.descriptor_type();
+            start[2] = self.descriptor_subtype();
+            copy_const(start, 3..len, self.as_slice());
+            Ok(())
         }
     }
 }

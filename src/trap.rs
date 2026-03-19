@@ -1,13 +1,11 @@
-use core::arch::{asm, naked_asm};
+use core::arch::naked_asm;
 
 use crate::{
     blink_partial_value, blink_value,
-    common::{
-        Defer, csr_clear_imm, csr_read, csr_read_set_imm, csr_read_write, csr_set, csr_set_imm,
-        csr_write,
-    },
+    common::{Defer, csr_clear_imm, csr_read, csr_read_set_imm, csr_set, csr_set_imm, csr_write},
     delay,
     gpio::{LED_PIN, gpio_output_xor},
+    timer_trap_handler,
     usb::usb_trap_handler,
 };
 
@@ -18,6 +16,9 @@ const RVCSR_MEPC: u32 = 0x341;
 const RVCSR_MCAUSE: u32 = 0x342;
 const RVCSR_MEINEXT: u32 = 0xBE4;
 const RVCSR_MEICONTEXT: u32 = 0xBE5;
+
+pub const RVCSR_MEIFA: u32 = 0xBE2;
+pub const RVCSR_MEIEA: u32 = 0xBE0;
 
 const RVCSR_MSTATUS_MIE: usize = 1 << 3;
 const RVCSR_MIE_MEIE: usize = 1 << 11;
@@ -144,19 +145,28 @@ fn handle_external_interrupt() {
     Defer::new(|| unsafe { csr_write::<RVCSR_MEICONTEXT>(meicontext) });
 
     loop {
-        const RVCSR_MEINEXT_UPDATE: usize = 1 << 1;
+        const RVCSR_MEINEXT_UPDATE: usize = 1 << 0;
         let next = unsafe { csr_read_set_imm::<RVCSR_MEINEXT, RVCSR_MEINEXT_UPDATE>() };
         if next >> 31 != 0 {
             break;
         }
         let next_irq = next >> 2;
+        let curr_context = unsafe { csr_read::<RVCSR_MEICONTEXT>() };
+        assert_eq!(curr_context >> 15 & 0b1, next >> 31);
+        assert_eq!(curr_context >> 4 & 0xFF, next_irq & 0xFF);
+        assert!(unsafe { csr_read::<0x344>() & (1 << 11) } != 0);
 
         unsafe { csr_set_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() };
-        Defer::new(|| unsafe { csr_clear_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() });
+        // Defer::new(|| unsafe { csr_clear_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() });
 
-        // blink_partial_value(next_irq, 6);
+        // blink_partial_value(unsafe { csr_read::<0xBE1>() } >> 16, 16);
+
         // table 95 in rp2350 datasheet
         match next_irq {
+            0..=7 => {
+                // timer interrupts
+                timer_trap_handler(next_irq);
+            }
             14 => {
                 usb_trap_handler();
             }
@@ -167,7 +177,8 @@ fn handle_external_interrupt() {
             52.. => {
                 unreachable!()
             }
-        }
+        };
+        unsafe { csr_clear_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() };
     }
 }
 

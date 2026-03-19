@@ -1,4 +1,6 @@
-use core::{arch::asm, mem::MaybeUninit};
+use core::{arch::asm, mem::MaybeUninit, ops::Range};
+
+use crate::assert;
 
 #[derive(Copy, Clone)]
 pub struct AliasedRegister(*mut u32);
@@ -159,4 +161,29 @@ pub unsafe fn csr_read_clear_imm<const CSR: u32, const VALUE: usize>() -> usize 
         asm!("csrrc     {read}, {CSR}, {value}", read = out(reg) read, value = const VALUE, CSR = const CSR);
     }
     read
+}
+
+pub const fn copy_const(dst: &mut [u8], range: Range<usize>, src: &[u8]) {
+    assert!(range.end >= range.start);
+    let len = range.end - range.start;
+    assert!(dst.len() >= range.end);
+    assert!(src.len() == len);
+    let mut i = 0;
+    while i < len {
+        dst[range.start + i] = src[i];
+        i += 1;
+    }
+}
+
+#[macro_export]
+macro_rules! const_for {
+    ($val:ident in $arr:expr => $expr:block) => {
+        let mut i = 0;
+        let arr = $arr;
+        while i < arr.len() {
+            let $val = &arr[i];
+            $expr
+            i += 1;
+        }
+    };
 }

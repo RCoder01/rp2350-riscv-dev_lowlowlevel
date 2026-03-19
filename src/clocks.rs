@@ -1,5 +1,3 @@
-use core::ptr;
-
 use crate::{
     assert, assert_eq,
     common::{AliasedRegister, nop_volatile},
@@ -26,7 +24,7 @@ pub const ROSC_RANDOM: AliasedRegister = unsafe { ROSC_BASE.offset_bytes(0xC) };
 pub const ROSC_RANDOMBIT: AliasedRegister = unsafe { ROSC_BASE.offset_bytes(0x20) };
 pub const ROSC_COUNT: AliasedRegister = unsafe { ROSC_BASE.offset_bytes(0x24) };
 
-const XOSC_HZ: u32 = 12_000_000;
+pub const XOSC_HZ: u32 = 12_000_000;
 
 pub fn init_xosc() {
     XOSC_STARTUP.write(0x11A);

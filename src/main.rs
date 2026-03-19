@@ -1,7 +1,8 @@
 #![no_std]
 #![no_main]
+#![forbid(unsafe_op_in_unsafe_fn)]
 
-use core::ops::RangeInclusive;
+use core::{ops::RangeInclusive, time::Duration};
 
 use crate::{
     clocks::{enable_usb_clock, init_xosc, switch_sys_clock_to_xosc},
@@ -10,6 +11,7 @@ use crate::{
         DRIVE_STRENGTH_12MA, LED_PIN, PULL_DOWN_ENABLE, SIO, gpio_ctrl_reg, gpio_output_clear,
         gpio_output_enable, gpio_output_xor, pads_gpio_reg,
     },
+    timer::timer::{Alarm, TIMER0},
     trap::init_traps,
     usb::init_usb_as_device,
 };
@@ -19,6 +21,7 @@ mod common;
 mod gpio;
 mod resets;
 mod startup;
+mod timer;
 mod trap;
 mod usb;
 
@@ -55,15 +58,35 @@ pub extern "C" fn main() -> ! {
 
     init_xosc();
     switch_sys_clock_to_xosc();
-    enable_usb_clock();
+    // enable_usb_clock();
 
     init_traps();
-    init_usb_as_device();
+    init_alarms();
+    enable_timer();
+    // init_usb_as_device();
 
     loop {
         // gpio_output_xor(LED_PIN);
-        delay(10);
+        // delay(10);
     }
+}
+
+fn init_alarms() {
+    timer::ticks::TIMER0.enable(clocks::XOSC_HZ / 1_000_000);
+    TIMER0.reset();
+    TIMER0.enable_alarms();
+}
+
+fn enable_timer() {
+    TIMER0
+        .set_alarm(Alarm::Alarm1, Duration::from_millis(10_000))
+        .expect("Duration is not too long");
+}
+
+pub fn timer_trap_handler(_alarm: usize) {
+    assert!(_alarm == 1);
+    gpio_output_xor(LED_PIN);
+    enable_timer();
 }
 
 fn extract_bits(word: u32, range: RangeInclusive<u32>) -> u32 {
@@ -118,19 +141,6 @@ fn delay(units: u32) {
         nop_volatile();
     }
 }
-
-// fn delay(units: u32) {
-//     for _ in 0..(units * 3) {
-//         delay_cycles(0xFFFF);
-//     }
-// }
-//
-// fn delay_cycles(cycles: u16) {
-//     ROSC_COUNT.write(cycles as u32);
-//     while ROSC_COUNT.read() != 0 {
-//         nop_volatile();
-//     }
-// }
 
 #[panic_handler]
 fn panic_handler(_: &core::panic::PanicInfo) -> ! {
