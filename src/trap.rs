@@ -2,8 +2,8 @@ use core::arch::naked_asm;
 
 use crate::{
     blink_partial_value, blink_value,
-    common::{Defer, csr_clear_imm, csr_read, csr_read_set_imm, csr_set, csr_set_imm, csr_write},
-    delay,
+    common::{csr_clear_imm, csr_read, csr_read_set_imm, csr_set, csr_set_imm, csr_write},
+    defer, delay,
     gpio::{LED_PIN, gpio_output_xor},
     timer_trap_handler,
     usb::usb_trap_handler,
@@ -31,59 +31,60 @@ pub fn init_traps() {
 }
 
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 extern "C" fn trap_handler_wrapper() {
     naked_asm!(
         "addi   sp, sp, -18*4",
-        "sw     x1, -0*4(sp)",
-        "sw     x3, -1*4(sp)",
-        "sw     x4, -2*4(sp)",
-        "sw     x5, -3*4(sp)",
-        "sw     x6, -4*4(sp)",
-        "sw     x7, -5*4(sp)",
-        "sw     x10, -6*4(sp)",
-        "sw     x11, -7*4(sp)",
-        "sw     x12, -8*4(sp)",
-        "sw     x13, -9*4(sp)",
-        "sw     x14, -10*4(sp)",
-        "sw     x15, -11*4(sp)",
-        "sw     x16, -12*4(sp)",
-        "sw     x17, -13*4(sp)",
-        "sw     x28, -14*4(sp)",
-        "sw     x29, -15*4(sp)",
-        "sw     x30, -16*4(sp)",
-        "sw     x31, -17*4(sp)",
+        "sw     x1, 0*4(sp)",
+        "sw     x3, 1*4(sp)",
+        "sw     x4, 2*4(sp)",
+        "sw     x5, 3*4(sp)",
+        "sw     x6, 4*4(sp)",
+        "sw     x7, 5*4(sp)",
+        "sw     x10, 6*4(sp)",
+        "sw     x11, 7*4(sp)",
+        "sw     x12, 8*4(sp)",
+        "sw     x13, 9*4(sp)",
+        "sw     x14, 10*4(sp)",
+        "sw     x15, 11*4(sp)",
+        "sw     x16, 12*4(sp)",
+        "sw     x17, 13*4(sp)",
+        "sw     x28, 14*4(sp)",
+        "sw     x29, 15*4(sp)",
+        "sw     x30, 16*4(sp)",
+        "sw     x31, 17*4(sp)",
         // trap handler will save callee-saved registers if necessary
         "call   trap_handler",
-        "lw     x1, -0*4(sp)",
-        "lw     x3, -1*4(sp)",
-        "lw     x4, -2*4(sp)",
-        "lw     x5, -3*4(sp)",
-        "lw     x6, -4*4(sp)",
-        "lw     x7, -5*4(sp)",
-        "lw     x10, -6*4(sp)",
-        "lw     x11, -7*4(sp)",
-        "lw     x12, -8*4(sp)",
-        "lw     x13, -9*4(sp)",
-        "lw     x14, -10*4(sp)",
-        "lw     x15, -11*4(sp)",
-        "lw     x16, -12*4(sp)",
-        "lw     x17, -13*4(sp)",
-        "lw     x28, -14*4(sp)",
-        "lw     x29, -15*4(sp)",
-        "lw     x30, -16*4(sp)",
-        "lw     x31, -17*4(sp)",
+        "lw     x1, 0*4(sp)",
+        "lw     x3, 1*4(sp)",
+        "lw     x4, 2*4(sp)",
+        "lw     x5, 3*4(sp)",
+        "lw     x6, 4*4(sp)",
+        "lw     x7, 5*4(sp)",
+        "lw     x10, 6*4(sp)",
+        "lw     x11, 7*4(sp)",
+        "lw     x12, 8*4(sp)",
+        "lw     x13, 9*4(sp)",
+        "lw     x14, 10*4(sp)",
+        "lw     x15, 11*4(sp)",
+        "lw     x16, 12*4(sp)",
+        "lw     x17, 13*4(sp)",
+        "lw     x28, 14*4(sp)",
+        "lw     x29, 15*4(sp)",
+        "lw     x30, 16*4(sp)",
+        "lw     x31, 17*4(sp)",
         "addi   sp, sp, 18*4",
-        "mret"
+        "mret",
     );
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn trap_handler() {
     let cause = unsafe { csr_read::<RVCSR_MCAUSE>() };
-    Defer::new(|| unsafe { csr_write::<RVCSR_MCAUSE>(cause) });
+    defer!(|| unsafe { csr_write::<RVCSR_MCAUSE>(cause) });
 
     let addr = unsafe { csr_read::<RVCSR_MEPC>() };
-    Defer::new(|| unsafe { csr_write::<RVCSR_MEPC>(addr) });
+    defer!(|| unsafe { csr_write::<RVCSR_MEPC>(addr) });
 
     match cause {
         0x0 => {
@@ -119,7 +120,7 @@ extern "C" fn trap_handler() {
         }
         ..=0x7FFF_FFFF => {
             // unknown interrupt
-            blink_trap_cause(cause, addr)
+            unrecoverable_trap(cause, addr)
         }
         0x8000_0003 => {
             // soft irq
@@ -133,33 +134,37 @@ extern "C" fn trap_handler() {
         }
         0x8000_0000.. => {
             // unknown interrupt
-            blink_trap_cause(cause, addr)
+            unrecoverable_trap(cause, addr)
         }
     }
-    blink_trap_cause_once(cause, addr);
+    unrecoverable_trap(cause, addr);
 }
 
 fn handle_external_interrupt() {
     const RVCSR_MEICONTEXT_CLEARTS: usize = 1 << 1;
     let meicontext = unsafe { csr_read_set_imm::<RVCSR_MEICONTEXT, RVCSR_MEICONTEXT_CLEARTS>() };
-    Defer::new(|| unsafe { csr_write::<RVCSR_MEICONTEXT>(meicontext) });
+    defer!(|| unsafe { csr_write::<RVCSR_MEICONTEXT>(meicontext) });
+    // blink_value(meicontext);
+    // fast_blink(40);
 
     loop {
         const RVCSR_MEINEXT_UPDATE: usize = 1 << 0;
+        // let next_before = unsafe { csr_read::<RVCSR_MEINEXT>() };
+        // if next_before >> 31 == 0 {
+        //     assert!(unsafe { csr_read::<0x344>() } != 0);
+        // }
         let next = unsafe { csr_read_set_imm::<RVCSR_MEINEXT, RVCSR_MEINEXT_UPDATE>() };
+        // blink_value(next);
+        // fast_blink(40);
         if next >> 31 != 0 {
             break;
         }
         let next_irq = next >> 2;
-        let curr_context = unsafe { csr_read::<RVCSR_MEICONTEXT>() };
-        assert_eq!(curr_context >> 15 & 0b1, next >> 31);
-        assert_eq!(curr_context >> 4 & 0xFF, next_irq & 0xFF);
-        assert!(unsafe { csr_read::<0x344>() & (1 << 11) } != 0);
 
-        unsafe { csr_set_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() };
-        // Defer::new(|| unsafe { csr_clear_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() });
-
-        // blink_partial_value(unsafe { csr_read::<0xBE1>() } >> 16, 16);
+        let status = unsafe { csr_read_set_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() };
+        defer!(|| unsafe { csr_clear_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() });
+        // blink_value(status);
+        // fast_blink(40);
 
         // table 95 in rp2350 datasheet
         match next_irq {
@@ -178,11 +183,10 @@ fn handle_external_interrupt() {
                 unreachable!()
             }
         };
-        unsafe { csr_clear_imm::<RVCSR_MSTATUS, RVCSR_MSTATUS_MIE>() };
     }
 }
 
-fn blink_trap_cause(cause: usize, addr: usize) -> ! {
+fn unrecoverable_trap(cause: usize, addr: usize) -> ! {
     loop {
         blink_trap_cause_once(cause, addr);
     }

@@ -58,16 +58,16 @@ pub extern "C" fn main() -> ! {
 
     init_xosc();
     switch_sys_clock_to_xosc();
-    // enable_usb_clock();
+    enable_usb_clock();
 
     init_traps();
     init_alarms();
     enable_timer();
-    // init_usb_as_device();
+    init_usb_as_device();
 
     loop {
-        // gpio_output_xor(LED_PIN);
-        // delay(10);
+        gpio_output_xor(LED_PIN);
+        delay(10);
     }
 }
 
@@ -79,13 +79,14 @@ fn init_alarms() {
 
 fn enable_timer() {
     TIMER0
-        .set_alarm(Alarm::Alarm1, Duration::from_millis(10_000))
+        .set_alarm(Alarm::Alarm1, Duration::from_millis(1_000))
         .expect("Duration is not too long");
 }
 
 pub fn timer_trap_handler(_alarm: usize) {
     assert!(_alarm == 1);
-    gpio_output_xor(LED_PIN);
+    TIMER0.clear_alarm_event(Alarm::Alarm1);
+    // gpio_output_xor(LED_PIN);
     enable_timer();
 }
 

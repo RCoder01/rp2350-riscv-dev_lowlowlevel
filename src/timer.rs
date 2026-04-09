@@ -107,7 +107,7 @@ pub mod timer {
             unsafe { self.base.offset_bytes(0x1C) }
         }
 
-        pub fn armed(self) -> AliasedRegister {
+        fn armed(self) -> AliasedRegister {
             unsafe { self.base.offset_bytes(0x20) }
         }
 
@@ -210,6 +210,10 @@ pub mod timer {
             self.intf().clear(1 << (alarm as u32));
             self.alarm(alarm).write(target);
             Ok(())
+        }
+
+        pub fn clear_alarm_event(self, alarm: Alarm) {
+            self.intr().clear(1 << (alarm as u32));
         }
     }
 

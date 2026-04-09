@@ -70,6 +70,13 @@ impl<F: FnOnce()> Drop for Defer<F> {
     }
 }
 
+#[macro_export]
+macro_rules! defer {
+    ($fn: expr) => {
+        let _defer = $crate::common::Defer::new($fn);
+    };
+}
+
 #[inline(always)]
 pub fn nop_volatile() {
     unsafe {

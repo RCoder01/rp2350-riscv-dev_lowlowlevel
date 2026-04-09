@@ -154,7 +154,7 @@ pub fn init_usb_as_device() {
     // and when a setup packet is received
     USBCTRL_INTE.write(USBINT_BUF_STATUS | USBINT_BUS_RESET | USBINT_SETUP_REQ | 0);
 
-    // DEVICE_CONFIG.configure_endpoints();
+    DEVICE_CONFIG.configure_endpoints();
 
     const SIE_PULLUP_ENABLE: u32 = 1 << 16;
     // Present full speed device by enabling pull up on DP
@@ -299,9 +299,6 @@ const SIE_STATUS_BUS_RESET: u32 = 1 << 19;
 pub fn usb_trap_handler() {
     const NEW_ADDR: *mut u8 = 0x20000000 as *mut u8;
     let mut status = USBCTRL_INTS.read();
-    if FLAG.read() != 0 {
-        FLAG.write(FLAG.read() + 1);
-    }
 
     if (status & USBINT_SETUP_REQ) != 0 {
         status ^= USBINT_SETUP_REQ;
@@ -330,7 +327,7 @@ pub fn usb_trap_handler() {
                 Err(0x20) => {
                     // set line coding request
                     acknowledge_out_request();
-                    FLAG.write(1);
+                    FLAG.write(FLAG.read() + 1);
                 }
                 Err(0x22) => {
                     // set control line state
